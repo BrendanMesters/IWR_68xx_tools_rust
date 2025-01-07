@@ -2,8 +2,7 @@ use serial2::SerialPort;
 use std::io::Error;
 use std::{thread, time::Duration};
 
-use super::config::Config;
-use super::settings::Settings;
+use super::file_reader::{Config, Settings};
 
 #[allow(dead_code)]
 pub struct Fmcw {

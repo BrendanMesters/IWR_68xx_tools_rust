@@ -1,14 +1,13 @@
 use std::path::Path;
 use std::{thread, time::Duration};
 
-mod config;
+mod file_reader;
 mod fmcw_manager;
-mod settings;
 mod tlv_translator;
 
-use config::Config;
+use file_reader::{read_byte_file, Config, Settings};
 use fmcw_manager::Fmcw;
-use settings::Settings;
+use tlv_translator::translate_tlv;
 
 fn main() {
     ctrlc::set_handler(move || {
@@ -21,24 +20,25 @@ fn main() {
     // Ctrl-C. As an example: Let's wait a few seconds.
     thread::sleep(Duration::from_secs(2));
     let settings_path = Path::new("./settings.toml");
-    let settings: Settings = Settings::new(&settings_path);
+    let settings: Settings = Settings::from_file(&settings_path);
 
     let config_path = Path::new("./iwr68xx_config.cfg");
-    let config: Config = match Config::init_conf(config_path) {
-        Ok(conf) => conf,
-        Err(e) => {
-            eprintln!("?{}", e.to_string());
-            std::process::exit(-1);
-        }
-    };
+    let config: Config = get_result(Config::from_file(&config_path));
 
-    let fmcw = match Fmcw::new(settings, config) {
-        Ok(fmcw) => fmcw,
+    let fmcw = get_result(Fmcw::new(settings, config));
+    fmcw.send_config();
+
+    let tlv_path = Path::new("./tlv_example_file");
+    let tlv_bytes: Vec<u8> = get_result(read_byte_file(tlv_path));
+    loop {}
+}
+
+fn get_result<T>(maybe_result: Result<T, std::io::Error>) -> T {
+    match maybe_result {
+        Ok(res) => res,
         Err(e) => {
             eprintln!("?{}", e.to_string());
             std::process::exit(-1);
         }
-    };
-    fmcw.send_config();
-    loop {}
+    }
 }

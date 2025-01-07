@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Error;
 use std::path::Path;
 
 pub struct Settings {
@@ -11,7 +12,7 @@ pub struct Settings {
 impl Settings {
     /// This function reads the file at the provided path
     /// and tries to generate settings for the IWR64xx fmcw module.
-    pub fn new(settings_file_path: &Path) -> Settings {
+    pub fn from_file(settings_file_path: &Path) -> Settings {
         let possible_contents = fs::read_to_string(settings_file_path);
         if possible_contents.is_err() {
             println!("Settings file path was incorrect, returning the default path instead.");
@@ -49,12 +50,36 @@ impl Settings {
     }
 
     // Some sane default values when using the code on linux
-    fn default() -> Settings {
+    pub fn default() -> Settings {
         Settings {
             cfg_port: "/dev/ttyUSB0".to_string(),
             cfg_baud: 115200,
             data_port: "/dev/ttyUSB1".to_string(),
             data_baud: 921600,
         }
+    }
+}
+
+pub struct Config {
+    pub raw_input: String,
+}
+
+impl Config {
+    pub fn from_file(config_path: &Path) -> Result<Config, Error> {
+        let possible_conf = fs::read_to_string(config_path);
+        if possible_conf.is_err() {
+            let err: std::io::Error = possible_conf
+                .err()
+                .expect("Error checking has already been done");
+            return Err(err);
+        }
+        let conf_str: String = possible_conf.expect("checked to be non-eroneous");
+        return Ok(Config::parse_conf_string(conf_str));
+    }
+
+    fn parse_conf_string(config: String) -> Config {
+        let raw_input = config.clone();
+        let conf = Config { raw_input };
+        return conf;
     }
 }

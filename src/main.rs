@@ -21,23 +21,33 @@ fn main() {
     thread::sleep(Duration::from_secs(2));
     let settings_path = Path::new("./settings.toml");
     let settings: Settings = Settings::from_file(&settings_path);
+    println!("Settings success");
 
     let config_path = Path::new("./iwr68xx_config.cfg");
     let config: Config = get_result(Config::from_file(&config_path));
+    println!("Config success");
 
-    let fmcw = get_result(Fmcw::new(settings, config));
-    fmcw.send_config();
+    match Fmcw::new(settings, config) {
+        Ok(fmcw) => {
+            println!("FMCW module loaded succesfully");
+            fmcw.send_config();
+        }
+        Err(e) => {
+            eprintln!("FMCW module could not connect, with error: {}\n    This error is most likely caused due to the FMCW not being connected.", e);
+        }
+    }
 
-    let tlv_path = Path::new("./tlv_example_file");
-    let tlv_bytes: Vec<u8> = get_result(read_byte_file(tlv_path));
-    loop {}
+    let tlv_path = Path::new("./tlv_example_file.dat");
+    let mut tlv_bytes: Vec<u8> = get_result(read_byte_file(tlv_path));
+    println!("Size of buf: {}", tlv_bytes.len());
+    translate_tlv(&mut tlv_bytes);
 }
 
 fn get_result<T>(maybe_result: Result<T, std::io::Error>) -> T {
     match maybe_result {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("?{}", e.to_string());
+            eprintln!("{}", e.to_string());
             std::process::exit(-1);
         }
     }

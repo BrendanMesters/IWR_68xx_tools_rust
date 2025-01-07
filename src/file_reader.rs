@@ -1,5 +1,5 @@
-use std::fs;
-use std::io::Error;
+use std::fs::{read_to_string, File};
+use std::io::{Error, Read};
 use std::path::Path;
 
 pub struct Config {
@@ -8,7 +8,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_file(config_path: &Path) -> Result<Config, Error> {
-        let possible_conf = fs::read_to_string(config_path);
+        let possible_conf = read_to_string(config_path);
         if possible_conf.is_err() {
             let err: std::io::Error = possible_conf
                 .err()
@@ -37,7 +37,7 @@ impl Settings {
     /// This function reads the file at the provided path
     /// and tries to generate settings for the IWR64xx fmcw module.
     pub fn from_file(settings_file_path: &Path) -> Settings {
-        let possible_contents = fs::read_to_string(settings_file_path);
+        let possible_contents = read_to_string(settings_file_path);
         if possible_contents.is_err() {
             println!("Settings file path was incorrect, returning the default path instead.");
             return Settings::default();
@@ -98,16 +98,8 @@ impl Settings {
 /// * `Result<Vec<u8>, Error>`: Either the bytes
 /// contained in the file or an error
 pub fn read_byte_file(path: &Path) -> Result<Vec<u8>, Error> {
-    let possible_file = fs::read_to_string(path);
-    if possible_file.is_err() {
-        let err: std::io::Error = possible_file
-            .err()
-            .expect("Error checking has already been done");
-        return Err(err);
-    }
-    let output: Vec<u8> = possible_file
-        .expect("checked to be non-eroneous")
-        .as_bytes()
-        .to_vec();
-    return Ok(output);
+    let mut file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    return Ok(buffer);
 }

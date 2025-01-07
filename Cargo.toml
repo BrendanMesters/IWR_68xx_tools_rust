@@ -1,0 +1,8 @@
+[package]
+name = "IWR_68xx_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctrlc = "3.4.5"
+serial2 = "0.2.28"

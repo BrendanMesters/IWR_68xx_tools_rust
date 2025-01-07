@@ -2,6 +2,30 @@ use std::fs;
 use std::io::Error;
 use std::path::Path;
 
+pub struct Config {
+    pub raw_input: String,
+}
+
+impl Config {
+    pub fn from_file(config_path: &Path) -> Result<Config, Error> {
+        let possible_conf = fs::read_to_string(config_path);
+        if possible_conf.is_err() {
+            let err: std::io::Error = possible_conf
+                .err()
+                .expect("Error checking has already been done");
+            return Err(err);
+        }
+        let conf_str: String = possible_conf.expect("checked to be non-eroneous");
+        return Ok(Config::parse_conf_string(conf_str));
+    }
+
+    fn parse_conf_string(config: String) -> Config {
+        let raw_input = config.clone();
+        let conf = Config { raw_input };
+        return conf;
+    }
+}
+
 pub struct Settings {
     pub cfg_port: String,
     pub cfg_baud: u32,
@@ -60,26 +84,30 @@ impl Settings {
     }
 }
 
-pub struct Config {
-    pub raw_input: String,
-}
-
-impl Config {
-    pub fn from_file(config_path: &Path) -> Result<Config, Error> {
-        let possible_conf = fs::read_to_string(config_path);
-        if possible_conf.is_err() {
-            let err: std::io::Error = possible_conf
-                .err()
-                .expect("Error checking has already been done");
-            return Err(err);
-        }
-        let conf_str: String = possible_conf.expect("checked to be non-eroneous");
-        return Ok(Config::parse_conf_string(conf_str));
+/// `Read bytes file` reads in a raw bytes file
+/// located at `path` and returns the contents
+/// as a `Vec` if it exists and an `io::Error`
+/// otherwise
+///
+/// # Arguments
+///
+/// * `path`: The path to the file
+///
+/// # Returns
+///
+/// * `Result<Vec<u8>, Error>`: Either the bytes
+/// contained in the file or an error
+pub fn read_byte_file(path: &Path) -> Result<Vec<u8>, Error> {
+    let possible_file = fs::read_to_string(path);
+    if possible_file.is_err() {
+        let err: std::io::Error = possible_file
+            .err()
+            .expect("Error checking has already been done");
+        return Err(err);
     }
-
-    fn parse_conf_string(config: String) -> Config {
-        let raw_input = config.clone();
-        let conf = Config { raw_input };
-        return conf;
-    }
+    let output: Vec<u8> = possible_file
+        .expect("checked to be non-eroneous")
+        .as_bytes()
+        .to_vec();
+    return Ok(output);
 }

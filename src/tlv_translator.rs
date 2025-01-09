@@ -1,5 +1,5 @@
+use plotters::prelude::*;
 use std::{collections::VecDeque, mem::ManuallyDrop};
-
 pub struct PointCloud {}
 
 /// The header part has 40 Bytes (320 bits) of data seperated into:
@@ -237,7 +237,7 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloud>, usize) {
         }
         println!("");
         i += 1;
-        if i > 25 {
+        if i > 5 {
             break;
         }
     }
@@ -299,7 +299,9 @@ fn parse_frame(mut data: Vec<u8>) {
             match TlvType::from_num(tlv_header.tlv_type()) {
                 Some(TlvType::DetectedPoints) => {}
                 Some(TlvType::RangeProfile) => {
+                    println!("Range profile");
                     let data = parse_raw_range_profile(raw_tlv_data);
+                    render_kde(&data);
                 }
                 Some(TlvType::NoiseFloorProfile) => {}
                 Some(TlvType::AzimuthStaticHeatmap) => {}
@@ -318,7 +320,89 @@ fn parse_frame(mut data: Vec<u8>) {
     println!("leftover data in frame: {}", data.len())
 }
 
-fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f32> {
+fn render_kde(data: &Vec<f64>) {
+    // We need to convert our series to a Kernel Density Estimate
+    // Then we want to render the kernel density estimate as an
+    // Area series with the Plotter crate.
+
+    // Set variables for KDE
+    const SHARPNESS: isize = 3; // Number of points per 1 distance
+    const MARGINS: isize = 10; // Margins to both ends of the min and max val
+    const KERNEL_SIZE: f64 = 17.0f64; // Size of the kernel
+
+    let min = data
+        .iter()
+        .min_by(|a, b| a.total_cmp(b))
+        .expect("The data passed to kde should not contain NaN numbers");
+    let max = data
+        .iter()
+        .max_by(|a, b| a.total_cmp(b))
+        .expect("The data passed to kde should not contain NaN numbers");
+
+    // Get the datarange on which we will calculate height
+    let datarange: Vec<f64> = (((min * SHARPNESS as f64) as isize - MARGINS * SHARPNESS)
+        ..=((max * SHARPNESS as f64) as isize - MARGINS * SHARPNESS))
+        .map(|v| v as f64 / SHARPNESS as f64)
+        .collect();
+
+    // Apply KDE
+    let kde: Vec<(f64, f64)> = datarange
+        .iter()
+        .map(|x| {
+            let mut y: f64 = 0.0f64;
+            for p in data {
+                if (p - *x).abs() < KERNEL_SIZE as f64 {
+                    y += (p - *x).abs() / KERNEL_SIZE as f64;
+                }
+            }
+            (*x, y as f64)
+        })
+        .collect();
+    let max_y = kde
+        .iter()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(x, y)| y)
+        .expect("Y values should always be comparable");
+
+    // Render result with plotters
+    let root = BitMapBackend::new("./plotters-doc-data/5.png", (640, 480)).into_drawing_area();
+    let _ = root.fill(&WHITE);
+    let root = root.margin(10, 10, 10, 10);
+
+    // After this point, we should be able to construct a chart context
+    let mut chart = match ChartBuilder::on(&root)
+        // Set the caption of the chart
+        .caption("KDE Range Profile", ("sans-serif", 40).into_font())
+        // Set the size of the label region
+        .x_label_area_size(20)
+        .y_label_area_size(40)
+        // Finally attach a coordinate on the drawing area and make a chart context
+        .build_cartesian_2d(*min..*max, 0f64..*max_y)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
+
+    // Then we can draw a mesh
+    let _ = chart
+        .configure_mesh()
+        // We can customize the maximum number of labels allowed for each axis
+        .x_labels(5)
+        .y_labels(5)
+        // We can also change the format of the label text
+        .y_label_formatter(&|x| format!("{:.3}", x))
+        .draw();
+
+    // And we can draw something in the drawing area
+    let _ = chart.draw_series(AreaSeries::new(kde, 0., &RED));
+    // Similarly, we can draw point series
+    let _ = root.present();
+}
+
+fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f64> {
     // We need to parse the data (`rangebin` * 16_bit) into a vector
     // of `rangebin` values, where every value is interpreted according
     // to 'Q9' encoding (this is a fixed point encoding) and return
@@ -333,7 +417,7 @@ fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f32> {
         .map(|(lower, upper)| (((*lower as u16) << 8) | *upper as u16))
         // Now to do q9 encoding according to the following formula P[db] = 20 * log10( 2.^(logMagRange/2^9) )
         // Accoring to this forum post https://e2e.ti.com/support/sensors-group/sensors/f/sensors-forum/806905/linux-iwr1443boost-interpreting-data-log-magnitude-range-and-doppler-heatmap
-        .map(|log_mag_range| 20.0 * f32::log10(2f32.powi(log_mag_range as i32) / 2f32.powi(9)))
+        .map(|log_mag_range| 20.0 * f64::log10(2f64.powf(log_mag_range as f64 / 2.0f64.powi(9))))
         .collect()
 }
 

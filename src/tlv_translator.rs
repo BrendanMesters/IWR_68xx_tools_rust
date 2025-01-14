@@ -1,6 +1,53 @@
 use plotters::prelude::*;
-use std::{collections::VecDeque, mem::ManuallyDrop};
-pub struct PointCloud {}
+use std::{
+    collections::VecDeque,
+    f32::consts::PI,
+    fs::File,
+    io::{prelude, Error, Write},
+    mem::ManuallyDrop,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
+
+/// This struct is supposed to represent pointclouds, via the
+/// uart specification of TI.
+/// In this specification each point in a pointcloud is
+/// represented by an x, y and z value, as well as its
+/// doppler velocity.
+/// Each of these variables takes up exactly 4 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PointCloudPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+    d: f32,
+}
+#[repr(C)]
+union PcHelper {
+    data: [u8; 16],
+    pc: PointCloudPoint,
+}
+
+impl PointCloudPoint {
+    pub fn from_bytes(data: [u8; 16]) -> PointCloudPoint {
+        let pc_helper = PcHelper { data };
+        // this is actually safe since the data size of Pointcloudpoint
+        // (4 x 32 = 128) and pcHelper.data (8 x 16 = 128) are the same
+        // AND because both are layed out in c representation
+        return unsafe { pc_helper.pc };
+    }
+
+    pub fn empty() -> PointCloudPoint {
+        PointCloudPoint {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            d: 0.0,
+        }
+    }
+}
 
 /// The header part has 40 Bytes (320 bits) of data seperated into:
 /// 8   -   Magic Word
@@ -54,6 +101,14 @@ impl FrameHeader {
         // C represented arrays, meaning the data is just thrown
         // on a large heap.
         unsafe { self.headers.frame_number }.try_into().unwrap()
+    }
+
+    fn subframe_num(&self) -> usize {
+        // Union field access is ALWAYS specified as unsafe
+        // This access is safe, since the types are stored as
+        // C represented arrays, meaning the data is just thrown
+        // on a large heap.
+        unsafe { self.headers.subframe_number }.try_into().unwrap()
     }
 
     fn tlv_count(&self) -> usize {
@@ -179,6 +234,39 @@ pub fn is_magic(input: &Vec<u8>, index: usize) -> bool {
     &input[index..(index + 8)] == MAGIC_WORD
 }
 
+pub fn parse_stream(rx: mpsc::Receiver<Vec<u8>>) {
+    let mut byte_stream: Vec<u8> = vec![];
+    let mut file = match File::create("./output_tls.dat") {
+        Ok(file) => file,
+        Err(_) => {
+            return;
+        }
+    };
+    loop {
+        // Add all new received packages to the byte stream
+        let mut received: bool = false;
+        if let Ok(new_bytes) = rx.recv() {
+            byte_stream.append(&mut new_bytes.clone());
+            received = true;
+
+            _ = file.write_all(&new_bytes);
+        }
+
+        if received {
+            println!(
+                "Received packages, bytestream length = {}",
+                byte_stream.len()
+            );
+            // Process the byte stream
+            translate_tlv(&mut byte_stream);
+        } else {
+            println!("Did not receive packages");
+            // If there where no packets to be received, sleep for ⅒   second
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 /// The function takes a `TLV byte array` as input and
 /// parses as much of it as it can.
 ///
@@ -195,7 +283,7 @@ pub fn is_magic(input: &Vec<u8>, index: usize) -> bool {
 /// A tuple containing:
 /// * `Vec<PointCloud>` - a vector of frames in the pointcloud
 /// * `usize` - The length of the pointcloud consumed.
-pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloud>, usize) {
+pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloudPoint>, usize) {
     let input_size = input.len();
     if input_size < 8 {
         println!("`translate_tlv` was called with an input of size {}, try calling it with an input of *at least* size 8", input_size);
@@ -213,16 +301,14 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloud>, usize) {
         magic_indexes[0], magic_indexes[1]
     );
 
-    let mut consumed_bytes = 0;
-    let mut i = 0;
     let mut prev_size = input.len();
-    let mut cur_size = 0;
-    for mi in magic_indexes {
+    let mut cur_size;
+    for _mi in magic_indexes {
         // if mi != consumed_bytes {
         //     println!("The current magic index does not seem to be at the current start of the data, magic index at {mi} encountered, while only {consumed_bytes} bytes where consumed");
         // }
-        println!("Start is a magic word");
-        if let Some((pc, n)) = read_frame(input) {
+        // println!("Start is a magic word");
+        if let Some((_pc, n)) = read_frame(input) {
             println!("Succesfully parsed a frame of size {}", n);
             cur_size = input.len();
             println!(
@@ -236,10 +322,10 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloud>, usize) {
             }
         }
         println!("");
-        i += 1;
-        if i > 5 {
-            break;
-        }
+        // i += 1;
+        // if i > 50 {
+        //     break;
+        // }
     }
 
     (vec![], 0)
@@ -255,7 +341,7 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloud>, usize) {
 /// * A `PointCloud` object for this single frame
 /// * A `usize`, representing the number of bytes from the input consumed
 /// Or `None` if the frame is not complete.
-fn read_frame(data: &mut Vec<u8>) -> Option<(PointCloud, usize)> {
+fn read_frame(data: &mut Vec<u8>) -> Option<(PointCloudPoint, usize)> {
     let header: FrameHeader = read_header(data)?;
 
     // Check that the frame is complete
@@ -274,34 +360,47 @@ fn read_frame(data: &mut Vec<u8>) -> Option<(PointCloud, usize)> {
     );
     // remove 40 from the drainage size as we already removed the header
     let raw_frame: Vec<u8> = data.drain(0..(frame_len - 40)).collect();
-    parse_frame(raw_frame);
+    parse_frame(header, raw_frame);
 
-    return Some((PointCloud {}, frame_len));
+    return Some((PointCloudPoint::empty(), frame_len));
     // Removing a "frame" can be done effectively with `std::vec::Vec::drain()`.
 }
 
-fn parse_frame(mut data: Vec<u8>) {
+fn parse_frame(frame_header: FrameHeader, mut data: Vec<u8>) -> Vec<Vec<PointCloudPoint>> {
     // Remove the frame header
-    data.drain(0..40);
+    println!(
+        "Subframe num: {}, tlv count: {}",
+        frame_header.subframe_num(),
+        frame_header.tlv_count()
+    );
+
+    let mut result: Vec<Vec<PointCloudPoint>> = vec![];
+
     loop {
         if let Some(tlv_header) = TlvHeader::extract_tlv_header(&mut data) {
-            println!(
-                "Tlv data, type: {} - len: {}, type debug: {:#034b}",
-                tlv_header.tlv_type(),
-                tlv_header.tlv_len(),
-                tlv_header.tlv_type(),
-            );
+            // println!(
+            //     "Tlv data, type: {} - len: {}, type debug: {:#034b}",
+            //     tlv_header.tlv_type(),
+            //     tlv_header.tlv_len(),
+            //     tlv_header.tlv_type(),
+            // );
             if tlv_header.tlv_len() > data.len() {
                 break;
             }
 
-            let raw_tlv_data: Vec<u8> = data.drain(0..tlv_header.tlv_len()).collect();
+            let mut raw_tlv_data: Vec<u8> = data.drain(0..tlv_header.tlv_len()).collect();
             match TlvType::from_num(tlv_header.tlv_type()) {
-                Some(TlvType::DetectedPoints) => {}
+                Some(TlvType::DetectedPoints) => {
+                    let frame_cloud = parse_detected_points(raw_tlv_data);
+                    println!("frame cloud size = {}", frame_cloud.len());
+                    result.push(frame_cloud);
+                }
                 Some(TlvType::RangeProfile) => {
                     println!("Range profile");
                     let data = parse_raw_range_profile(raw_tlv_data);
-                    render_kde(&data);
+                    let _ = std::fs::create_dir_all("./plots/range_profile/");
+                    let name = format!("./plots/range_profile/{}.png", frame_header.frame_num());
+                    render_kde(&data, name.as_str());
                 }
                 Some(TlvType::NoiseFloorProfile) => {}
                 Some(TlvType::AzimuthStaticHeatmap) => {}
@@ -312,15 +411,58 @@ fn parse_frame(mut data: Vec<u8>) {
                 Some(TlvType::TemperatureStatistics) => {}
                 None => break,
             }
-            println!("- Current data remaining: {}", data.len());
+            // println!("- Current data remaining: {}", data.len());
         } else {
             break;
         }
     }
-    println!("leftover data in frame: {}", data.len())
+    println!("-= Printing PointCloud =-");
+    for ptc_frame in result.as_slice() {
+        for ptc in ptc_frame {
+            print!("{:?}  ", ptc);
+        }
+        println!("");
+    }
+    return result;
 }
 
-fn render_kde(data: &Vec<f64>) {
+fn parse_detected_points(mut data: Vec<u8>) -> Vec<PointCloudPoint> {
+    let mut result: Vec<PointCloudPoint> = vec![];
+    //
+    // Each point takes up 16 bytes, so we want to itterate over every point
+    for _ in 0..(data.len() / 16) {
+        let raw: [u8; 16] = match data[..16].try_into() {
+            Ok(v) => v,
+            Err(_) => {
+                println!("Error when casting detected point data");
+                break;
+            }
+        };
+        result.push(PointCloudPoint::from_bytes(raw));
+    }
+    return result;
+}
+
+fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f64> {
+    // We need to parse the data (`rangebin` * 16_bit) into a vector
+    // of `rangebin` values, where every value is interpreted according
+    // to 'Q9' encoding (this is a fixed point encoding) and return
+    // a vector (or array) containing the new values.
+    // https://en.wikipedia.org/wiki/Q_(number_format)
+
+    // Change the byte string into a list of u16s
+    let even_indexed = data.iter().step_by(2);
+    let uneven_indexed = data.iter().skip(1).step_by(2);
+    even_indexed
+        .zip(uneven_indexed)
+        .map(|(lower, upper)| (((*lower as u16) << 8) | *upper as u16))
+        // Now to do q9 encoding according to the following formula P[db] = 20 * log10( 2.^(logMagRange/2^9) )
+        // Accoring to this forum post https://e2e.ti.com/support/sensors-group/sensors/f/sensors-forum/806905/linux-iwr1443boost-interpreting-data-log-magnitude-range-and-doppler-heatmap
+        .map(|log_mag_range| 20.0 * f64::log10(2f64.powf(log_mag_range as f64 / 2.0f64.powi(9))))
+        .collect()
+}
+
+fn render_kde(data: &Vec<f64>, filename: &str) {
     // We need to convert our series to a Kernel Density Estimate
     // Then we want to render the kernel density estimate as an
     // Area series with the Plotter crate.
@@ -352,7 +494,7 @@ fn render_kde(data: &Vec<f64>) {
             let mut y: f64 = 0.0f64;
             for p in data {
                 if (p - *x).abs() < KERNEL_SIZE as f64 {
-                    y += (p - *x).abs() / KERNEL_SIZE as f64;
+                    y += ((p - *x) / KERNEL_SIZE as f64 * 2.0).cos();
                 }
             }
             (*x, y as f64)
@@ -365,7 +507,7 @@ fn render_kde(data: &Vec<f64>) {
         .expect("Y values should always be comparable");
 
     // Render result with plotters
-    let root = BitMapBackend::new("./plotters-doc-data/5.png", (640, 480)).into_drawing_area();
+    let root = BitMapBackend::new(filename, (640, 480)).into_drawing_area();
     let _ = root.fill(&WHITE);
     let root = root.margin(10, 10, 10, 10);
 
@@ -401,26 +543,6 @@ fn render_kde(data: &Vec<f64>) {
     // Similarly, we can draw point series
     let _ = root.present();
 }
-
-fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f64> {
-    // We need to parse the data (`rangebin` * 16_bit) into a vector
-    // of `rangebin` values, where every value is interpreted according
-    // to 'Q9' encoding (this is a fixed point encoding) and return
-    // a vector (or array) containing the new values.
-    // https://en.wikipedia.org/wiki/Q_(number_format)
-
-    // Change the byte string into a list of u16s
-    let even_indexed = data.iter().step_by(2);
-    let uneven_indexed = data.iter().skip(1).step_by(2);
-    even_indexed
-        .zip(uneven_indexed)
-        .map(|(lower, upper)| (((*lower as u16) << 8) | *upper as u16))
-        // Now to do q9 encoding according to the following formula P[db] = 20 * log10( 2.^(logMagRange/2^9) )
-        // Accoring to this forum post https://e2e.ti.com/support/sensors-group/sensors/f/sensors-forum/806905/linux-iwr1443boost-interpreting-data-log-magnitude-range-and-doppler-heatmap
-        .map(|log_mag_range| 20.0 * f64::log10(2f64.powf(log_mag_range as f64 / 2.0f64.powi(9))))
-        .collect()
-}
-
 /// Attempts to read a header located at the the top of the input,
 /// This is a non-destructive operation, returning an `Option<Header>`
 fn read_header(input: &Vec<u8>) -> Option<FrameHeader> {

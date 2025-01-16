@@ -1,3 +1,6 @@
 /target
 plotters-doc-data
 plots/range_profile
+plots/range_profile.bak
+frame_output.json
+output_tls.dat

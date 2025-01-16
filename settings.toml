@@ -1,0 +1,8 @@
+cfg_port = /dev/ttyUSB0
+cfg_baud=115200
+data_port= /dev/ttyUSB1
+data_baud = 921600
+read_from_file = false
+save_raw_data=true
+save_frames=false
+ipc_send=true

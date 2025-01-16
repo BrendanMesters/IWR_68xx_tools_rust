@@ -1,6 +1,6 @@
 use serial2::SerialPort;
 use std::io::Error;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::{thread, time::Duration};
 
 use super::file_reader::{Config, Settings};
@@ -14,12 +14,12 @@ pub struct Fmcw {
 
 impl Fmcw {
     /// create a new FMCW object, based off of a settings struct
-    pub fn new(settings: Settings, config: Config) -> Result<Fmcw, Error> {
-        let cfg = match SerialPort::open(settings.cfg_port, settings.cfg_baud) {
+    pub fn new(settings: Arc<Settings>, config: Config) -> Result<Fmcw, Error> {
+        let cfg = match SerialPort::open(&settings.cfg_port, settings.cfg_baud) {
             Ok(v) => v,
             Err(v) => return Err(v),
         };
-        let data = match SerialPort::open(settings.data_port, settings.data_baud) {
+        let data = match SerialPort::open(&settings.data_port, settings.data_baud) {
             Ok(v) => v,
             Err(v) => return Err(v),
         };
@@ -61,12 +61,14 @@ impl Fmcw {
     }
 
     pub fn send_config(&self) {
+        println!("    Printing config");
         for line in self.config.raw_input.lines() {
             let line = format!("{}\n", line);
             let char_buf = line.as_bytes();
             let buf_size = char_buf.len();
             match self.cfg.write(char_buf) {
                 Ok(n) => {
+                    print!("{}", line);
                     if buf_size != n {
                         println!("Buffersize and written characters not equal, buffer size is {buf_size} but only {n} characters where written");
                     }
@@ -78,7 +80,7 @@ impl Fmcw {
             // Let some time elapse before continuing
             thread::sleep(Duration::from_millis(10));
         }
-        println!("Finished sending Config to the FMCW");
+        println!("\nFinished sending Config to the FMCW\n");
     }
 
     // Tries to read bytes from the FMCW, passing through any IO

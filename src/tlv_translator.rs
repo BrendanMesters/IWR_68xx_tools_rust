@@ -1,14 +1,47 @@
-use plotters::prelude::*;
+use crate::file_reader::Settings;
+
+use super::renderer;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
-    f32::consts::PI,
     fs::File,
-    io::{prelude, Error, Write},
-    mem::ManuallyDrop,
-    sync::mpsc,
+    io::Write,
+    sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Frame {
+    frame_num: usize,
+    pointcloud: Option<Vec<PointCloudPoint>>,
+    range_profile: Option<Vec<f64>>,
+}
+
+impl Frame {
+    pub fn empty(frame_num: usize) -> Frame {
+        Frame {
+            frame_num,
+            pointcloud: None,
+            range_profile: None,
+        }
+    }
+
+    pub fn set_pointcloud(&mut self, pc: Vec<PointCloudPoint>) {
+        self.pointcloud = Some(pc);
+    }
+
+    pub fn set_range_profile(&mut self, rp: Vec<f64>) {
+        self.range_profile = Some(rp);
+    }
+
+    pub fn render_range_profile(&self) {
+        if let Some(rp) = &self.range_profile {
+            let _ = std::fs::create_dir_all("./plots/range_profile/");
+            let name = format!("./plots/range_profile/{}.png", self.frame_num);
+            renderer::render_range_profile(&rp, name.as_str());
+        }
+    }
+}
 
 /// This struct is supposed to represent pointclouds, via the
 /// uart specification of TI.
@@ -17,13 +50,14 @@ use std::{
 /// doppler velocity.
 /// Each of these variables takes up exactly 4 bytes.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PointCloudPoint {
-    x: f32,
-    y: f32,
-    z: f32,
-    d: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub d: f32,
 }
+
 #[repr(C)]
 union PcHelper {
     data: [u8; 16],
@@ -224,7 +258,7 @@ impl TlvHeader {
     }
 }
 
-pub fn is_magic(input: &Vec<u8>, index: usize) -> bool {
+fn is_magic(input: &Vec<u8>, index: usize) -> bool {
     const MAGIC_WORD: [u8; 8] = [0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07];
 
     let input_size = input.len();
@@ -234,13 +268,29 @@ pub fn is_magic(input: &Vec<u8>, index: usize) -> bool {
     &input[index..(index + 8)] == MAGIC_WORD
 }
 
-pub fn parse_stream(rx: mpsc::Receiver<Vec<u8>>) {
+/// Parses data which is provided, in packets, along the
+/// channel receiver `rx`.
+///
+/// **NOTE** This function never returns. It should be
+/// called as a new thread.
+pub fn parse_stream(
+    rx: mpsc::Receiver<Vec<u8>>,
+    ipc_tx: mpsc::Sender<Frame>,
+    settings: Arc<Settings>,
+) -> ! {
     let mut byte_stream: Vec<u8> = vec![];
-    let mut file = match File::create("./output_tls.dat") {
-        Ok(file) => file,
-        Err(_) => {
-            return;
-        }
+
+    // If there is an error in reading the file we WILL crash, this
+    // is not ideal behaviour
+    let raw_data_file: Option<File> = if settings.raw_data_save {
+        Some(File::create("./output_tls.dat").unwrap())
+    } else {
+        None
+    };
+    let frame_file: Option<File> = if settings.raw_data_save {
+        Some(File::create("./frame_output.json").unwrap())
+    } else {
+        None
     };
     loop {
         // Add all new received packages to the byte stream
@@ -249,16 +299,27 @@ pub fn parse_stream(rx: mpsc::Receiver<Vec<u8>>) {
             byte_stream.append(&mut new_bytes.clone());
             received = true;
 
-            _ = file.write_all(&new_bytes);
+            if let Some(ref f) = raw_data_file {
+                let mut file: &File = f;
+                _ = file.write_all(&new_bytes);
+            }
         }
 
+        // Process received bytes
         if received {
             println!(
                 "Received packages, bytestream length = {}",
                 byte_stream.len()
             );
             // Process the byte stream
-            translate_tlv(&mut byte_stream);
+            for frame in translate_tlv(&mut byte_stream) {
+                if let Some(ref f) = frame_file {
+                    let mut file: &File = f;
+                    let data = format!("{},", serde_json::to_string(&frame.clone()).unwrap());
+                    _ = file.write_all(&data.as_bytes());
+                }
+                _ = ipc_tx.send(frame);
+            }
         } else {
             println!("Did not receive packages");
             // If there where no packets to be received, sleep for ⅒   second
@@ -283,11 +344,11 @@ pub fn parse_stream(rx: mpsc::Receiver<Vec<u8>>) {
 /// A tuple containing:
 /// * `Vec<PointCloud>` - a vector of frames in the pointcloud
 /// * `usize` - The length of the pointcloud consumed.
-pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloudPoint>, usize) {
+pub fn translate_tlv(input: &mut Vec<u8>) -> Vec<Frame> {
     let input_size = input.len();
     if input_size < 8 {
         println!("`translate_tlv` was called with an input of size {}, try calling it with an input of *at least* size 8", input_size);
-        return (vec![], 0);
+        return vec![];
     }
     let mut magic_indexes: Vec<usize> = Vec::new();
     for i in 0..(input_size - 8) {
@@ -296,39 +357,15 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloudPoint>, usize) {
         }
     }
 
-    println!(
-        "First and second magic index are at locations {}, {}",
-        magic_indexes[0], magic_indexes[1]
-    );
+    let mut result: Vec<Frame> = vec![];
 
-    let mut prev_size = input.len();
-    let mut cur_size;
     for _mi in magic_indexes {
-        // if mi != consumed_bytes {
-        //     println!("The current magic index does not seem to be at the current start of the data, magic index at {mi} encountered, while only {consumed_bytes} bytes where consumed");
-        // }
-        // println!("Start is a magic word");
-        if let Some((_pc, n)) = read_frame(input) {
-            println!("Succesfully parsed a frame of size {}", n);
-            cur_size = input.len();
-            println!(
-                "Amount of bytes actually consumed: {}",
-                prev_size - cur_size
-            );
-            prev_size = cur_size;
-            if is_magic(input, 0) {
-            } else {
-                println!("Start is NOT a magic word");
-            }
+        if let Some(frame) = read_frame(input) {
+            result.push(frame);
         }
-        println!("");
-        // i += 1;
-        // if i > 50 {
-        //     break;
-        // }
     }
 
-    (vec![], 0)
+    result
 }
 
 /// A function for reading and  processing a single frame of our data.
@@ -341,7 +378,7 @@ pub fn translate_tlv(input: &mut Vec<u8>) -> (Vec<PointCloudPoint>, usize) {
 /// * A `PointCloud` object for this single frame
 /// * A `usize`, representing the number of bytes from the input consumed
 /// Or `None` if the frame is not complete.
-fn read_frame(data: &mut Vec<u8>) -> Option<(PointCloudPoint, usize)> {
+fn read_frame(data: &mut Vec<u8>) -> Option<Frame> {
     let header: FrameHeader = read_header(data)?;
 
     // Check that the frame is complete
@@ -360,13 +397,10 @@ fn read_frame(data: &mut Vec<u8>) -> Option<(PointCloudPoint, usize)> {
     );
     // remove 40 from the drainage size as we already removed the header
     let raw_frame: Vec<u8> = data.drain(0..(frame_len - 40)).collect();
-    parse_frame(header, raw_frame);
-
-    return Some((PointCloudPoint::empty(), frame_len));
-    // Removing a "frame" can be done effectively with `std::vec::Vec::drain()`.
+    Some(parse_frame(header, raw_frame))
 }
 
-fn parse_frame(frame_header: FrameHeader, mut data: Vec<u8>) -> Vec<Vec<PointCloudPoint>> {
+fn parse_frame(frame_header: FrameHeader, mut data: Vec<u8>) -> Frame {
     // Remove the frame header
     println!(
         "Subframe num: {}, tlv count: {}",
@@ -374,59 +408,38 @@ fn parse_frame(frame_header: FrameHeader, mut data: Vec<u8>) -> Vec<Vec<PointClo
         frame_header.tlv_count()
     );
 
-    let mut result: Vec<Vec<PointCloudPoint>> = vec![];
+    let mut frame = Frame::empty(frame_header.frame_num());
 
-    loop {
-        if let Some(tlv_header) = TlvHeader::extract_tlv_header(&mut data) {
-            // println!(
-            //     "Tlv data, type: {} - len: {}, type debug: {:#034b}",
-            //     tlv_header.tlv_type(),
-            //     tlv_header.tlv_len(),
-            //     tlv_header.tlv_type(),
-            // );
-            if tlv_header.tlv_len() > data.len() {
-                break;
-            }
-
-            let mut raw_tlv_data: Vec<u8> = data.drain(0..tlv_header.tlv_len()).collect();
-            match TlvType::from_num(tlv_header.tlv_type()) {
-                Some(TlvType::DetectedPoints) => {
-                    let frame_cloud = parse_detected_points(raw_tlv_data);
-                    println!("frame cloud size = {}", frame_cloud.len());
-                    result.push(frame_cloud);
-                }
-                Some(TlvType::RangeProfile) => {
-                    println!("Range profile");
-                    let data = parse_raw_range_profile(raw_tlv_data);
-                    let _ = std::fs::create_dir_all("./plots/range_profile/");
-                    let name = format!("./plots/range_profile/{}.png", frame_header.frame_num());
-                    render_kde(&data, name.as_str());
-                }
-                Some(TlvType::NoiseFloorProfile) => {}
-                Some(TlvType::AzimuthStaticHeatmap) => {}
-                Some(TlvType::RangeDopplerHeatmap) => {}
-                Some(TlvType::PerformanceStatistics) => {}
-                Some(TlvType::SideInforForDetectedPoints) => {}
-                Some(TlvType::AzimuthElevationStaticHeatmap) => {}
-                Some(TlvType::TemperatureStatistics) => {}
-                None => break,
-            }
-            // println!("- Current data remaining: {}", data.len());
-        } else {
+    while let Some(tlv_header) = TlvHeader::extract_tlv_header(&mut data) {
+        if tlv_header.tlv_len() > data.len() {
             break;
         }
-    }
-    println!("-= Printing PointCloud =-");
-    for ptc_frame in result.as_slice() {
-        for ptc in ptc_frame {
-            print!("{:?}  ", ptc);
+
+        let raw_tlv_data: Vec<u8> = data.drain(0..tlv_header.tlv_len()).collect();
+        match TlvType::from_num(tlv_header.tlv_type()) {
+            Some(TlvType::DetectedPoints) => {
+                let point_cloud = parse_detected_points(raw_tlv_data);
+                frame.set_pointcloud(point_cloud);
+            }
+            Some(TlvType::RangeProfile) => {
+                let range_profile: Vec<f64> = parse_raw_range_profile(raw_tlv_data);
+                frame.set_range_profile(range_profile)
+            }
+            Some(TlvType::NoiseFloorProfile) => {}
+            Some(TlvType::AzimuthStaticHeatmap) => {}
+            Some(TlvType::RangeDopplerHeatmap) => {}
+            Some(TlvType::PerformanceStatistics) => {}
+            Some(TlvType::SideInforForDetectedPoints) => {}
+            Some(TlvType::AzimuthElevationStaticHeatmap) => {}
+            Some(TlvType::TemperatureStatistics) => {}
+            None => break,
         }
-        println!("");
     }
-    return result;
+    frame.render_range_profile();
+    return frame;
 }
 
-fn parse_detected_points(mut data: Vec<u8>) -> Vec<PointCloudPoint> {
+fn parse_detected_points(data: Vec<u8>) -> Vec<PointCloudPoint> {
     let mut result: Vec<PointCloudPoint> = vec![];
     //
     // Each point takes up 16 bytes, so we want to itterate over every point
@@ -462,87 +475,6 @@ fn parse_raw_range_profile(data: Vec<u8>) -> Vec<f64> {
         .collect()
 }
 
-fn render_kde(data: &Vec<f64>, filename: &str) {
-    // We need to convert our series to a Kernel Density Estimate
-    // Then we want to render the kernel density estimate as an
-    // Area series with the Plotter crate.
-
-    // Set variables for KDE
-    const SHARPNESS: isize = 3; // Number of points per 1 distance
-    const MARGINS: isize = 10; // Margins to both ends of the min and max val
-    const KERNEL_SIZE: f64 = 17.0f64; // Size of the kernel
-
-    let min = data
-        .iter()
-        .min_by(|a, b| a.total_cmp(b))
-        .expect("The data passed to kde should not contain NaN numbers");
-    let max = data
-        .iter()
-        .max_by(|a, b| a.total_cmp(b))
-        .expect("The data passed to kde should not contain NaN numbers");
-
-    // Get the datarange on which we will calculate height
-    let datarange: Vec<f64> = (((min * SHARPNESS as f64) as isize - MARGINS * SHARPNESS)
-        ..=((max * SHARPNESS as f64) as isize - MARGINS * SHARPNESS))
-        .map(|v| v as f64 / SHARPNESS as f64)
-        .collect();
-
-    // Apply KDE
-    let kde: Vec<(f64, f64)> = datarange
-        .iter()
-        .map(|x| {
-            let mut y: f64 = 0.0f64;
-            for p in data {
-                if (p - *x).abs() < KERNEL_SIZE as f64 {
-                    y += ((p - *x) / KERNEL_SIZE as f64 * 2.0).cos();
-                }
-            }
-            (*x, y as f64)
-        })
-        .collect();
-    let max_y = kde
-        .iter()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(x, y)| y)
-        .expect("Y values should always be comparable");
-
-    // Render result with plotters
-    let root = BitMapBackend::new(filename, (640, 480)).into_drawing_area();
-    let _ = root.fill(&WHITE);
-    let root = root.margin(10, 10, 10, 10);
-
-    // After this point, we should be able to construct a chart context
-    let mut chart = match ChartBuilder::on(&root)
-        // Set the caption of the chart
-        .caption("KDE Range Profile", ("sans-serif", 40).into_font())
-        // Set the size of the label region
-        .x_label_area_size(20)
-        .y_label_area_size(40)
-        // Finally attach a coordinate on the drawing area and make a chart context
-        .build_cartesian_2d(*min..*max, 0f64..*max_y)
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return;
-        }
-    };
-
-    // Then we can draw a mesh
-    let _ = chart
-        .configure_mesh()
-        // We can customize the maximum number of labels allowed for each axis
-        .x_labels(5)
-        .y_labels(5)
-        // We can also change the format of the label text
-        .y_label_formatter(&|x| format!("{:.3}", x))
-        .draw();
-
-    // And we can draw something in the drawing area
-    let _ = chart.draw_series(AreaSeries::new(kde, 0., &RED));
-    // Similarly, we can draw point series
-    let _ = root.present();
-}
 /// Attempts to read a header located at the the top of the input,
 /// This is a non-destructive operation, returning an `Option<Header>`
 fn read_header(input: &Vec<u8>) -> Option<FrameHeader> {
